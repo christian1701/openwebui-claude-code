@@ -881,6 +881,22 @@ def _strip_mode_prefix(prompt: str) -> str:
     return prompt
 
 
+_VALID_SETTING_SOURCES = ("user", "project", "local")
+
+
+def _parse_setting_sources(raw: str) -> List[str]:
+    """Parse the SETTING_SOURCES valve into a list the SDK accepts.
+
+    Empty / unset → `[]` (no filesystem settings loaded; clean baseline).
+    Unknown tokens are dropped so a typo can't silently widen inheritance.
+    """
+    return [
+        tok
+        for tok in (t.strip().lower() for t in raw.split(","))
+        if tok in _VALID_SETTING_SOURCES
+    ]
+
+
 def _needs_agent(prompt: str, files: Optional[List[Any]]) -> bool:
     """Route-per-turn heuristic. `/agent` / `/fast` prefixes are explicit
     overrides. Attachments force agent mode (the model should be able to
@@ -956,6 +972,20 @@ class Pipe:
         MAX_TURNS: int = Field(
             default=30,
             description="Maximum agent turns per user message. 0 disables the cap.",
+        )
+        SETTING_SOURCES: str = Field(
+            default="",
+            description=(
+                "Comma-separated Claude Code setting sources to load: any of "
+                '"user", "project", "local". Empty (default) loads NONE — each '
+                "chat runs from a clean baseline and does NOT inherit the "
+                "backend user's ~/.claude/ or the workdir's .claude/ config. "
+                'Add "user" to load ~/.claude/CLAUDE.md and ~/.claude/'
+                "settings.json (persistent context for single-user/homelab "
+                "setups). WARNING: settings.json can define hooks that execute "
+                "code and permission grants — only enable on instances you "
+                "trust and control. Avoid on multi-user/public deployments."
+            ),
         )
 
     def __init__(self) -> None:
@@ -1239,7 +1269,7 @@ class Pipe:
             "model": self.valves.MODEL,
             "permission_mode": self.valves.PERMISSION_MODE,
             "allowed_tools": kb_tool_names,
-            "setting_sources": [],
+            "setting_sources": _parse_setting_sources(self.valves.SETTING_SOURCES),
             "system_prompt": system_text,
             "include_partial_messages": True,
         }
@@ -1392,9 +1422,11 @@ class Pipe:
             "model": self.valves.MODEL,
             "permission_mode": self.valves.PERMISSION_MODE,
             "allowed_tools": allowed_tools,
-            # Don't load the host's ~/.claude/ or project .claude/ — OpenWebUI chats
-            # should run with an empty baseline, not inherit the backend user's config.
-            "setting_sources": [],
+            # Which filesystem settings to load (user ~/.claude/, project .claude/,
+            # local). Default empty = clean baseline, no inheritance of the backend
+            # user's config. Opt in via the SETTING_SOURCES valve (e.g. "user" to
+            # load ~/.claude/CLAUDE.md). See the valve's security warning.
+            "setting_sources": _parse_setting_sources(self.valves.SETTING_SOURCES),
             # Stream token-level deltas so long answers type out instead of
             # appearing as one chunk when the block finishes.
             "include_partial_messages": True,
