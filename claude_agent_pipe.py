@@ -2,7 +2,7 @@
 title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
-version: 0.1
+version: 0.2
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -13,6 +13,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -379,7 +380,7 @@ def _build_kb_mcp_server(
     that OpenWebUI's middleware already filtered by the user's grants.
     """
     if not knowledge:
-        return None, []
+        return None, [], {}
 
     collection_names = [k["id"] for k in knowledge]
     display = ", ".join(k["name"] for k in knowledge)
@@ -957,6 +958,18 @@ class Pipe:
             default="claude-haiku-4-5",
             description="Claude model ID (e.g. claude-haiku-4-5, claude-sonnet-4-6, claude-opus-4-7).",
         )
+        MODEL_HAIKU: str = Field(
+            default="claude-haiku-4-5",
+            description="Model behind the 'Claude Code (Haiku)' picker entry.",
+        )
+        MODEL_SONNET: str = Field(
+            default="claude-sonnet-4-6",
+            description="Model behind the 'Claude Code (Sonnet)' picker entry.",
+        )
+        MODEL_OPUS: str = Field(
+            default="claude-opus-4-7",
+            description="Model behind the 'Claude Code (Opus)' picker entry.",
+        )
         PERMISSION_MODE: str = Field(
             default="bypassPermissions",
             description='Permission mode: "default", "acceptEdits", "bypassPermissions", "plan", or "dontAsk".',
@@ -992,7 +1005,47 @@ class Pipe:
         self.valves = self.Valves()
 
     def pipes(self) -> List[Dict[str, str]]:
-        return [{"id": "claude-code", "name": "Claude Code"}]
+        return [
+            {"id": "haiku", "name": "Claude Code (Haiku)"},
+            {"id": "sonnet", "name": "Claude Code (Sonnet)"},
+            {"id": "opus", "name": "Claude Code (Opus)"},
+            # Stateless, clean-output variants for the OpenAI-compatible API:
+            # fresh completion per request, no session state, no <details>/
+            # thinking/tool decorations, no _Cost:_ footer, no tools. Picked
+            # purely by the "…-api" model id (see _is_stateless_api).
+            {"id": "haiku-api", "name": "Claude Code (Haiku · API/stateless)"},
+            {"id": "sonnet-api", "name": "Claude Code (Sonnet · API/stateless)"},
+            {"id": "opus-api", "name": "Claude Code (Opus · API/stateless)"},
+        ]
+
+    def _resolve_model(self, body: Dict[str, Any]) -> str:
+        """Map the picked manifold entry to a real Claude model id.
+
+        OpenWebUI passes the selected model as body["model"] in the form
+        "<function_id>.<pipe_id>" (e.g. "claude_agent_pipe.sonnet"). We take
+        the trailing pipe id and map it to the configured model. Falls back to
+        the MODEL valve if the id is unknown (e.g. an old pinned chat)."""
+        raw = (body or {}).get("model", "") or ""
+        key = raw.rsplit(".", 1)[-1].lower()
+        # Stateless variants share the same underlying models — strip the
+        # "-api" suffix so "…haiku-api" maps to MODEL_HAIKU (see pipes()).
+        if key.endswith("-api"):
+            key = key[: -len("-api")]
+        mapping = {
+            "haiku": self.valves.MODEL_HAIKU,
+            "sonnet": self.valves.MODEL_SONNET,
+            "opus": self.valves.MODEL_OPUS,
+        }
+        return mapping.get(key, self.valves.MODEL)
+
+    @staticmethod
+    def _is_stateless_api(body: Dict[str, Any]) -> bool:
+        """True when the caller picked a stateless "…-api" variant. The model
+        id arrives as "<function_id>.<pipe_id>" (e.g. "claude_code.haiku-api");
+        we look only at the trailing pipe id. This is the ONLY thing that
+        selects stateless mode — nothing else."""
+        raw = (body or {}).get("model", "") or ""
+        return raw.rsplit(".", 1)[-1].lower().endswith("-api")
 
     async def _run_fast(
         self,
@@ -1108,7 +1161,7 @@ class Pipe:
         MAX_TOOL_ROUNDS = 10
         for _round in range(MAX_TOOL_ROUNDS + 1):
             kwargs: Dict[str, Any] = {
-                "model": self.valves.MODEL,
+                "model": self._resolve_model(body),
                 "max_tokens": 4096,
                 "messages": messages,
             }
@@ -1124,9 +1177,7 @@ class Pipe:
                     final = await stream.get_final_message()
             except Exception as exc:
                 log.exception("Fast path failed")
-                yield (
-                    f"\n\n**Fast-path error:** `{type(exc).__name__}: {exc}`\n"
-                )
+                yield (f"\n\n**Fast-path error:** `{type(exc).__name__}: {exc}`\n")
                 return
 
             if final.stop_reason != "tool_use":
@@ -1266,7 +1317,7 @@ class Pipe:
         system_text = "\n\n".join(p for p in system_parts if p.strip())
 
         options_kwargs: Dict[str, Any] = {
-            "model": self.valves.MODEL,
+            "model": self._resolve_model(body),
             "permission_mode": self.valves.PERMISSION_MODE,
             "allowed_tools": kb_tool_names,
             "setting_sources": _parse_setting_sources(self.valves.SETTING_SOURCES),
@@ -1362,6 +1413,188 @@ class Pipe:
             log.exception("Lite-agent fast path failed")
             yield f"\n\n**Fast-path error:** `{type(exc).__name__}: {exc}`\n"
 
+    # -----------------------------------------------------------------------
+    # Stateless clean-output path for the "…-api" model variants. Entirely
+    # separate from the stateful agent loop below: fresh completion per
+    # request, no _chat_sessions, no per-chat workdir, no tools, and ONLY the
+    # model's final assistant text (no thinking/tool <details>, no footer).
+    # -----------------------------------------------------------------------
+
+    async def _run_stateless_clean(
+        self,
+        body: Dict[str, Any],
+        user_dict: Optional[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]],
+        files: Optional[List[Dict[str, Any]]],
+        event_emitter: Optional[Callable],
+    ) -> AsyncGenerator[str, None]:
+        """Dispatcher for the stateless variants. Mirrors _run_fast's auth
+        branching, but with NO decorations and NO session state:
+        1. API key available → direct Messages API (clean text only).
+        2. OAuth token only → one-shot ClaudeSDKClient (no tools, max_turns=1).
+        user_dict / metadata / files are accepted for signature parity but
+        unused here — stateless mode is tool-free and KB-free by design."""
+        has_api_key = bool(
+            self.valves.ANTHROPIC_API_KEY or os.environ.get("ANTHROPIC_API_KEY")
+        )
+        if has_api_key:
+            async for chunk in self._run_stateless_messages_api(body, event_emitter):
+                yield chunk
+        else:
+            async for chunk in self._run_stateless_lite_agent(body, event_emitter):
+                yield chunk
+
+    async def _run_stateless_messages_api(
+        self,
+        body: Dict[str, Any],
+        event_emitter: Optional[Callable],
+    ) -> AsyncGenerator[str, None]:
+        """Anthropic Messages-API completion, stripped to essentials: the
+        role=system messages become the system prompt, the latest user turn
+        is the query, and only assistant text deltas are yielded. No KB tools,
+        no tool <details>, no footer, no conversation memory across requests."""
+        try:
+            from anthropic import AsyncAnthropic
+        except ImportError:
+            yield "_The `-api` variants need the `anthropic` package — add it to the Function requirements._"
+            return
+
+        if self.valves.ANTHROPIC_API_KEY:
+            client = AsyncAnthropic(api_key=self.valves.ANTHROPIC_API_KEY)
+        else:
+            client = AsyncAnthropic()
+
+        prompt = _extract_latest_user_prompt(body)
+        if not prompt:
+            return
+        system = _extract_system_prompt(body)
+
+        kwargs: Dict[str, Any] = {
+            "model": self._resolve_model(body),
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system:
+            kwargs["system"] = system
+
+        try:
+            async with client.messages.stream(**kwargs) as stream:
+                async for text in stream.text_stream:
+                    yield text
+                final = await stream.get_final_message()
+        except Exception as exc:
+            log.exception("Stateless messages-API path failed")
+            yield f"\n\n**API error:** `{type(exc).__name__}: {exc}`\n"
+            return
+
+        await self._emit_usage(event_emitter, getattr(final, "usage", None))
+
+    async def _run_stateless_lite_agent(
+        self,
+        body: Dict[str, Any],
+        event_emitter: Optional[Callable],
+    ) -> AsyncGenerator[str, None]:
+        """OAuth-only stateless path: a one-shot ClaudeSDKClient with no tools,
+        no MCP servers, no filesystem settings, capped at a single turn. Yields
+        ONLY assistant text deltas — no thinking, no tool output, no footer.
+        Uses a throwaway workdir (never a chat_id-keyed one) and never reads or
+        writes _chat_sessions, so requests stay fully independent."""
+        prompt = _extract_latest_user_prompt(body)
+        if not prompt:
+            return
+        system = _extract_system_prompt(body)
+
+        # Unique throwaway workdir — reusing a chat_id-keyed dir would be state.
+        workdir = Path(self.valves.WORKDIR_ROOT) / "stateless" / uuid.uuid4().hex
+        workdir.mkdir(parents=True, exist_ok=True)
+
+        options_kwargs: Dict[str, Any] = {
+            "cwd": str(workdir),
+            "model": self._resolve_model(body),
+            "permission_mode": self.valves.PERMISSION_MODE,
+            "allowed_tools": [],
+            "setting_sources": [],
+            "max_turns": 1,
+            "include_partial_messages": True,
+        }
+        # A plain-string system_prompt REPLACES Claude Code's agent persona, so
+        # the reply is a clean completion. Omit it when the caller sent none.
+        if system:
+            options_kwargs["system_prompt"] = system
+        options = ClaudeAgentOptions(**options_kwargs)
+
+        usage: Any = None
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(prompt)
+                async for message in client.receive_response():
+                    if isinstance(message, StreamEvent):
+                        ev = message.event or {}
+                        if ev.get("type") == "content_block_delta":
+                            delta = ev.get("delta") or {}
+                            if delta.get("type") == "text_delta":
+                                yield delta.get("text", "")
+                    elif isinstance(message, ResultMessage):
+                        usage = getattr(message, "usage", None)
+                        break
+        except Exception as exc:
+            log.exception("Stateless lite-agent path failed")
+            yield f"\n\n**API error:** `{type(exc).__name__}: {exc}`\n"
+            return
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+        await self._emit_usage(event_emitter, usage)
+
+    async def _emit_usage(self, event_emitter: Optional[Callable], usage: Any) -> None:
+        """Best-effort: surface real token usage so OpenWebUI can forward it
+        into the /api/chat/completions `usage` object. Accepts either an
+        Anthropic Messages-API `Usage` object or the SDK ResultMessage's
+        `usage` dict.
+
+        OpenWebUI collects a `usage` dict from a `chat:completion` event during
+        streaming and merges it into the final response body
+        (utils/middleware.py:process_chat_response). We emit that event with the
+        OpenAI-shaped fields the caller reads (prompt_tokens / completion_tokens
+        / total_tokens + prompt_tokens_details.cached_tokens).
+
+        # TODO(usage): the exact contract for pipe-emitted usage isn't
+        # documented and may vary by OpenWebUI version — this needs end-to-end
+        # verification against a live instance. Tried: emitting the
+        # `chat:completion`/`usage` event below. If it doesn't land in
+        # response.usage it's a harmless no-op (the caller tolerates missing
+        # usage); a streaming generator pipe has no return value or response
+        # header to piggyback on, so this event is the only forwarding hook.
+        """
+        if event_emitter is None or usage is None:
+            return
+
+        def _field(name: str) -> Optional[int]:
+            val = (
+                usage.get(name)
+                if isinstance(usage, dict)
+                else getattr(usage, name, None)
+            )
+            try:
+                return int(val) if val is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        prompt_tokens = _field("input_tokens") or 0
+        completion_tokens = _field("output_tokens") or 0
+        payload: Dict[str, Any] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        cached = _field("cache_read_input_tokens")
+        if cached is not None:
+            payload["prompt_tokens_details"] = {"cached_tokens": cached}
+        try:
+            await event_emitter({"type": "chat:completion", "data": {"usage": payload}})
+        except Exception:
+            log.debug("usage emit failed", exc_info=True)
+
     async def pipe(
         self,
         body: Dict[str, Any],
@@ -1388,6 +1621,16 @@ class Pipe:
         # claude CLI refuses --dangerously-skip-permissions under root unless
         # told it's inside a sandbox. OpenWebUI's backend runs as UID 0.
         os.environ.setdefault("IS_SANDBOX", "1")
+
+        # Stateless "…-api" variants: fresh, clean, tool-free completion per
+        # request. Handled entirely before the stateful agent path below so
+        # they never touch _chat_sessions or the per-chat workdir.
+        if self._is_stateless_api(body):
+            async for chunk in self._run_stateless_clean(
+                body, __user__, __metadata__, __files__, __event_emitter__
+            ):
+                yield chunk
+            return
 
         prompt = _extract_latest_user_prompt(body)
         if not prompt:
@@ -1419,7 +1662,7 @@ class Pipe:
 
         options_kwargs: Dict[str, Any] = {
             "cwd": str(workdir),
-            "model": self.valves.MODEL,
+            "model": self._resolve_model(body),
             "permission_mode": self.valves.PERMISSION_MODE,
             "allowed_tools": allowed_tools,
             # Which filesystem settings to load (user ~/.claude/, project .claude/,
