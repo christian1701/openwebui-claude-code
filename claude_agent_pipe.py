@@ -986,6 +986,17 @@ class Pipe:
             default=30,
             description="Maximum agent turns per user message. 0 disables the cap.",
         )
+        ENABLE_FAST_PATH: bool = Field(
+            default=True,
+            description=(
+                "Route simple Q&A turns to the cheap Messages-API fast path "
+                "(~300 ms – 2 s) instead of the full Claude Code agent loop "
+                "(CLI cold-start ~3–5 s). Turns that need tools/files (plots, "
+                "PDFs, running code, attachments) still take the agent path. "
+                "Users can override per message with a leading `/agent` or "
+                "`/fast`. Disable to force every turn through the agent loop."
+            ),
+        )
         SETTING_SOURCES: str = Field(
             default="",
             description=(
@@ -1637,7 +1648,19 @@ class Pipe:
             yield "_No user message to send to Claude Code._"
             return
 
-        # Fast path disabled — always run the full agent loop.
+        # Gate: fast path for simple Q&A, agent path for tasks needing
+        # tools/files. Same model, different invocation cost. The user can
+        # always force with `/agent` or `/fast` at the start of their message;
+        # admins can disable the gate entirely via the ENABLE_FAST_PATH valve.
+        if self.valves.ENABLE_FAST_PATH and not _needs_agent(prompt, __files__):
+            async for chunk in self._run_fast(
+                body, __user__, __metadata__, __files__, __event_emitter__
+            ):
+                yield chunk
+            return
+
+        # Agent path: strip the `/agent` prefix (if any) so Claude doesn't
+        # see it as content.
         prompt = _strip_mode_prefix(prompt)
 
         chat_id = __chat_id__ or "default"
