@@ -78,6 +78,36 @@ _chat_sessions: Dict[str, str] = {}
 # "continuity bridge" block in pipe().
 _chat_seen_msg_count: Dict[str, int] = {}
 
+# Cap on tracked chats so these in-process maps don't grow unbounded on a
+# long-lived worker. Oldest-written entries are evicted first.
+_MAX_TRACKED_CHATS = 2000
+
+# Continuity-bridge bounds: at most this many prior turns are re-injected into
+# an agent prompt, each truncated to this many chars, so a long chat can't
+# build a prompt that overflows the model's context window.
+_MAX_BRIDGE_TURNS = 20
+_MAX_BRIDGE_CHARS_PER_TURN = 4000
+
+
+def _remember_session(chat_id: str, session_id: str, seen_count: int) -> None:
+    """Record the resume id and the continuity high-water mark for a chat as a
+    single unit.
+
+    Writing both together (at session init) is what keeps them consistent: if
+    they were updated at different points in the turn lifecycle, a turn that
+    failed after init would leave a resume id with a stale/absent mark, and the
+    next turn would re-inject the whole history on top of the resumed session.
+    Also bounds both maps to _MAX_TRACKED_CHATS, evicting the oldest chat.
+    """
+    # Re-insert at the end so an active chat counts as most-recently-used.
+    _chat_sessions.pop(chat_id, None)
+    _chat_sessions[chat_id] = session_id
+    _chat_seen_msg_count[chat_id] = seen_count
+    while len(_chat_sessions) > _MAX_TRACKED_CHATS:
+        oldest = next(iter(_chat_sessions))
+        _chat_sessions.pop(oldest, None)
+        _chat_seen_msg_count.pop(oldest, None)
+
 
 _TOOL_PREVIEW_FIELDS = {
     "Bash": "command",
@@ -920,6 +950,33 @@ def _strip_mode_prefix(prompt: str) -> str:
     return prompt
 
 
+def _message_text(msg: Dict[str, Any]) -> str:
+    """Flatten one chat message's content to plain text.
+
+    Handles the two shapes OpenWebUI sends (a bare string, or a list of
+    `{type, text}` parts) as well as a missing / null / non-string content
+    (returns ""), and strips the `/agent`|`/fast` prefix from user turns. This
+    is the single source of truth for turning a `body["messages"]` entry into
+    text — used by the fast paths and the agent-path continuity bridge so the
+    content-shape handling (and its null-safety) lives in exactly one place.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        content = "\n".join(
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    # Guard BEFORE any string op: OpenWebUI can send `"content": null` (e.g. an
+    # assistant turn that was only a tool call), and _strip_mode_prefix would
+    # raise AttributeError on None.
+    if not isinstance(content, str):
+        return ""
+    if msg.get("role") == "user":
+        content = _strip_mode_prefix(content)
+    return content.strip()
+
+
 _VALID_SETTING_SOURCES = ("user", "project", "local")
 
 
@@ -1179,15 +1236,7 @@ class Pipe:
             role = msg.get("role")
             if role not in ("user", "assistant"):
                 continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = "\n".join(
-                    p.get("text", "")
-                    for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                )
-            if role == "user":
-                content = _strip_mode_prefix(content)
+            content = _message_text(msg)
             if content:
                 messages.append({"role": role, "content": content})
 
@@ -1320,26 +1369,20 @@ class Pipe:
 
         history_lines: List[str] = []
         messages = body.get("messages") or []
-        user_turns_remaining = sum(1 for m in messages if m.get("role") == "user")
-        consumed = 0
-        for msg in messages:
+        # Skip the latest user turn — it's the query itself, sent separately.
+        last_user_idx = max(
+            (i for i, m in enumerate(messages) if m.get("role") == "user"),
+            default=-1,
+        )
+        for i, msg in enumerate(messages):
             role = msg.get("role")
             if role not in ("user", "assistant"):
                 continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = "\n".join(
-                    p.get("text", "")
-                    for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                )
-            if role == "user":
-                content = _strip_mode_prefix(content)
-                consumed += 1
-                if consumed == user_turns_remaining:
-                    continue  # skip the latest — it's the query itself
-            if content.strip():
-                history_lines.append(f"{role.capitalize()}: {content.strip()}")
+            if i == last_user_idx:
+                continue
+            text = _message_text(msg)
+            if text:
+                history_lines.append(f"{role.capitalize()}: {text}")
         if history_lines:
             system_parts.append(
                 "Prior conversation (for context):\n\n" + "\n\n".join(history_lines)
@@ -1723,28 +1766,32 @@ class Pipe:
         # agent turns inject nothing — the session already has them.
         messages = body.get("messages") or []
         seen = _chat_seen_msg_count.get(chat_id, 0) if resume_id else 0
-        missed = messages[seen:-1] if len(messages) - 1 > seen else []
+        # Exclude the current user turn (and anything after it) by its real
+        # index rather than assuming it is messages[-1] — a trailing
+        # assistant/system entry would otherwise push the live question into
+        # the "do not answer" context block below.
+        last_user_idx = max(
+            (i for i, m in enumerate(messages) if m.get("role") == "user"),
+            default=-1,
+        )
+        missed = messages[seen:last_user_idx] if last_user_idx > seen else []
+        # Bound how many turns we re-inject: per-turn char caps don't stop a
+        # long chat (dozens of prior fast turns) from producing an oversized
+        # prompt that overflows the context window. Keep only the most recent.
+        if len(missed) > _MAX_BRIDGE_TURNS:
+            missed = missed[-_MAX_BRIDGE_TURNS:]
         bridge_lines: List[str] = []
         for msg in missed:
             role = msg.get("role")
             if role not in ("user", "assistant"):
                 continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = "\n".join(
-                    p.get("text", "")
-                    for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                )
-            if role == "user":
-                content = _strip_mode_prefix(content)
-            text = (content or "").strip()
+            text = _message_text(msg)
             if not text:
                 continue
             # Cap each turn so a big prior answer (e.g. a full report) can't
             # blow up the context we prepend.
-            if len(text) > 4000:
-                text = text[:4000] + " …[truncated]"
+            if len(text) > _MAX_BRIDGE_CHARS_PER_TURN:
+                text = text[:_MAX_BRIDGE_CHARS_PER_TURN] + " …[truncated]"
             bridge_lines.append(f"{role.capitalize()}: {text}")
         if bridge_lines:
             prompt = (
@@ -1861,7 +1908,16 @@ class Pipe:
                         if message.subtype == "init":
                             session_id = message.data.get("session_id")
                             if session_id:
-                                _chat_sessions[chat_id] = session_id
+                                # Record the resume id and the continuity
+                                # high-water mark together, at the same moment,
+                                # so a turn that fails later can't leave them
+                                # inconsistent. The session now covers every
+                                # message through this turn; +1 accounts for the
+                                # assistant reply OpenWebUI appends after we
+                                # finish (an error message on failure counts too).
+                                _remember_session(
+                                    chat_id, session_id, len(messages) + 1
+                                )
                         continue
 
                     if isinstance(message, StreamEvent):
@@ -1960,12 +2016,6 @@ class Pipe:
 
                     if isinstance(message, ResultMessage):
                         await emit_status("Done.", done=True)
-                        # Advance the continuity high-water mark: the session
-                        # has now consumed every message up to and including
-                        # this turn. +1 accounts for the assistant reply
-                        # OpenWebUI appends after we finish, so the next agent
-                        # turn only re-injects genuinely new (fast-path) turns.
-                        _chat_seen_msg_count[chat_id] = len(messages) + 1
                         for chunk in _inline_new_artifacts(
                             scan_dirs,
                             artifact_snapshot,
