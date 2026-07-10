@@ -28,7 +28,25 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 4. Open the function's **Valves** and configure auth (one of):
    - `ANTHROPIC_API_KEY` — standard pay-per-token billing
    - `CLAUDE_CODE_OAUTH_TOKEN` — generate on a machine with a browser via `claude setup-token`; bills against your Pro/Max/Team subscription
-5. A new model named **Claude Code** will appear in the model picker.
+5. New **Claude Code** models will appear in the model picker (see below).
+
+## Model variants
+
+The pipe publishes two families of models. Which one you pick is the *only*
+thing that changes behaviour:
+
+| Picker entry | Model id | Mode |
+| --- | --- | --- |
+| Claude Code (Haiku / Sonnet / Opus) | `…​.haiku` / `.sonnet` / `.opus` | **Stateful agent** — full Claude Code loop, per-chat session resume + workspace, tools, and inline thinking/tool/cost decorations. |
+| Claude Code (Haiku / Sonnet / Opus · API/stateless) | `…​.haiku-api` / `.sonnet-api` / `.opus-api` | **Stateless, clean output** — a fresh, independent completion per request. No session resume, no tools, and **only** the model's final assistant text (no `<details>`, no thinking, no `_Cost:_` footer). |
+
+The `-api` variants are meant for external apps that call OpenWebUI's
+OpenAI-compatible endpoint (`POST /api/chat/completions`) and expect a clean,
+parseable assistant message with no shared state between requests. The
+`role=system` message is honoured as the system prompt and the latest `user`
+message is the query. Each `-api` variant maps to the same underlying model as
+its stateful sibling (via the `MODEL_HAIKU` / `MODEL_SONNET` / `MODEL_OPUS`
+valves).
 
 ## Configuration (Valves)
 
@@ -36,7 +54,10 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | *(env)* | Anthropic API key. Falls back to the backend's env var. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | *(empty)* | Claude subscription OAuth token. Takes priority over the API key when set. |
-| `MODEL` | `claude-haiku-4-5` | Claude model ID (e.g. `claude-haiku-4-5`, `claude-sonnet-4-6`, `claude-opus-4-7`). |
+| `MODEL` | `claude-haiku-4-5` | Fallback Claude model ID for unknown picker ids (e.g. `claude-haiku-4-5`, `claude-sonnet-4-6`, `claude-opus-4-7`). |
+| `MODEL_HAIKU` | `claude-haiku-4-5` | Model behind the Haiku picker entries (`.haiku` and `.haiku-api`). |
+| `MODEL_SONNET` | `claude-sonnet-4-6` | Model behind the Sonnet picker entries (`.sonnet` and `.sonnet-api`). |
+| `MODEL_OPUS` | `claude-opus-4-7` | Model behind the Opus picker entries (`.opus` and `.opus-api`). |
 | `PERMISSION_MODE` | `bypassPermissions` | `default`, `acceptEdits`, `bypassPermissions`, `plan`, or `dontAsk`. |
 | `ALLOWED_TOOLS` | `Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch` | Comma-separated tools auto-approved without prompting. |
 | `WORKDIR_ROOT` | `/tmp/claude-agent-pipe` | Root directory for per-chat workspaces. |
