@@ -39,6 +39,13 @@ _DOWNLOAD_EXTENSIONS = {
     ".zip",
 }
 _ARTIFACT_EXTENSIONS = _IMAGE_EXTENSIONS | _DOWNLOAD_EXTENSIONS
+# Output cap for the direct Messages-API fast paths. 4096 truncated long-form
+# answers (detailed explanations, code). Bumped to a ceiling that comfortably
+# covers those while staying well under every configured model's output limit
+# (Opus ~32k, Haiku/Sonnet ~64k) so a request never errors on an over-large
+# cap. Replies stream token-by-token, so a high ceiling adds no latency — it
+# only stops a genuinely long answer from being cut off mid-sentence.
+_FAST_MAX_TOKENS = 16384
 # Safety cap to avoid uploading runaway files. Uploaded artifacts are served
 # via OpenWebUI's file endpoint, so they don't bloat the chat history even
 # when large — this is only a "don't accidentally ship a DVD ISO" guard.
@@ -1199,7 +1206,7 @@ class Pipe:
         for _round in range(MAX_TOOL_ROUNDS + 1):
             kwargs: Dict[str, Any] = {
                 "model": self._resolve_model(body),
-                "max_tokens": 4096,
+                "max_tokens": _FAST_MAX_TOKENS,
                 "messages": messages,
             }
             if system:
@@ -1508,7 +1515,7 @@ class Pipe:
 
         kwargs: Dict[str, Any] = {
             "model": self._resolve_model(body),
-            "max_tokens": 4096,
+            "max_tokens": _FAST_MAX_TOKENS,
             "messages": [{"role": "user", "content": prompt}],
         }
         if system:
