@@ -865,9 +865,33 @@ _AGENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# German task/imperative signals. The English _AGENT_PATTERN above misses
+# German task requests ("erstelle ein Diagramm", "führe das Skript aus"),
+# which would then wrongly ride the tool-less fast path and silently fail. We
+# lean generous here on purpose: routing a plain question to the agent is only
+# slower, but routing a real task to the fast path breaks it (no Bash/Write/
+# Read). Bare cognate stems (diagramm/visualisier/analysier) match compounds
+# like "Balkendiagramm"; the verb branches require an artifact noun so
+# "erstelle eine Zusammenfassung" (no tool needed) stays on the fast path.
+_AGENT_PATTERN_DE = re.compile(
+    r"("
+    r"diagramm|visualisier|"
+    r"analysier|"
+    r"herunterlad|herunterläd|runterlad|"
+    r"\blade?\b[^.\n]{0,30}\b(herunter|runter)\b|"
+    r"ausführ|"
+    r"\bführe?\b[^.\n]{0,25}\baus\b|"
+    r"\b(erstell|erzeug|generier|schreib|speicher|exportier|zeichne|plotte|rendere?)\w*\s+"
+    r"(\w+\s+){0,3}?"
+    r"(datei|dateien|skript|script|code|programm|grafik|bild|"
+    r"report|bericht|pdf|csv|excel|tabelle|diagramm|plot|graph)"
+    r")",
+    re.IGNORECASE,
+)
+
 # Mentioning a file extension is a strong "the user has / wants a file" signal.
 _FILE_EXT_PATTERN = re.compile(
-    r"\.(pdf|csv|tsv|xlsx|xls|docx|pptx|png|jpe?g|svg|html?|json|md|ipynb|zip|tar\.gz)\b",
+    r"\.(pdf|csv|tsv|txt|xlsx|xls|docx|pptx|png|jpe?g|svg|html?|json|md|py|ipynb|zip|tar\.gz)\b",
     re.IGNORECASE,
 )
 
@@ -912,6 +936,8 @@ def _needs_agent(prompt: str, files: Optional[List[Any]]) -> bool:
     if files:
         return True
     if _AGENT_PATTERN.search(stripped):
+        return True
+    if _AGENT_PATTERN_DE.search(stripped):
         return True
     if _FILE_EXT_PATTERN.search(stripped):
         return True
