@@ -71,6 +71,13 @@ log = logging.getLogger(__name__)
 # map in-process so follow-up turns resume the same Claude Code session.
 _chat_sessions: Dict[str, str] = {}
 
+# High-water mark per chat: how many body["messages"] entries the resumed
+# Claude Code session has already consumed. Used to bridge mixed-mode
+# continuity — turns answered by the fast path never enter the session, so on
+# the next agent turn we re-inject the ones the session hasn't seen. See the
+# "continuity bridge" block in pipe().
+_chat_seen_msg_count: Dict[str, int] = {}
+
 
 _TOOL_PREVIEW_FIELDS = {
     "Bash": "command",
@@ -1705,6 +1712,49 @@ class Pipe:
         ]
         resume_id = _chat_sessions.get(chat_id)
 
+        # Mixed-mode continuity bridge. A resumed Claude Code session only
+        # contains turns that previously ran through THIS agent path; turns
+        # answered by the fast path never touch the session. Without help the
+        # agent would be blind to them — a follow-up like "erstelle ein
+        # Diagramm daraus" couldn't resolve "daraus". Re-inject the visible
+        # turns the session hasn't consumed yet: all prior turns for a fresh
+        # session (resume_id is None), or only the intervening fast-path turns
+        # for a resumed one (tracked via the high-water mark). Consecutive
+        # agent turns inject nothing — the session already has them.
+        messages = body.get("messages") or []
+        seen = _chat_seen_msg_count.get(chat_id, 0) if resume_id else 0
+        missed = messages[seen:-1] if len(messages) - 1 > seen else []
+        bridge_lines: List[str] = []
+        for msg in missed:
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            if role == "user":
+                content = _strip_mode_prefix(content)
+            text = (content or "").strip()
+            if not text:
+                continue
+            # Cap each turn so a big prior answer (e.g. a full report) can't
+            # blow up the context we prepend.
+            if len(text) > 4000:
+                text = text[:4000] + " …[truncated]"
+            bridge_lines.append(f"{role.capitalize()}: {text}")
+        if bridge_lines:
+            prompt = (
+                "[Earlier conversation you may not have in context — for "
+                "reference only, do not answer these again:]\n\n"
+                + "\n\n".join(bridge_lines)
+                + "\n\n[Current request:]\n"
+                + prompt
+            )
+
         # Knowledge base attached via Workspace Model → expose as an MCP tool
         # Claude can call agentically. OpenWebUI's middleware already added one
         # entry per attached KB to files/__files__.
@@ -1910,6 +1960,12 @@ class Pipe:
 
                     if isinstance(message, ResultMessage):
                         await emit_status("Done.", done=True)
+                        # Advance the continuity high-water mark: the session
+                        # has now consumed every message up to and including
+                        # this turn. +1 accounts for the assistant reply
+                        # OpenWebUI appends after we finish, so the next agent
+                        # turn only re-injects genuinely new (fast-path) turns.
+                        _chat_seen_msg_count[chat_id] = len(messages) + 1
                         for chunk in _inline_new_artifacts(
                             scan_dirs,
                             artifact_snapshot,
